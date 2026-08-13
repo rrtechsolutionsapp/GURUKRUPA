@@ -5162,8 +5162,21 @@ function tickClock(){
    from the IP, which needs no DNS at all. */
 var RR_PRIMARY   = 'rrjewellersetawah.in';
 var RR_FALLBACK  = 'live.rrjewellersetawah.in';       // same server, second name, second cache entry
-var RR_FALLBACK2 = '187-127-169-121.sslip.io';        // IP-derived: resolves without the zone
-var _rrHosts     = [RR_PRIMARY, RR_FALLBACK, RR_FALLBACK2];
+  /* The third host is gone. It was an sslip.io name that spells the origin's IPv4 address in its
+     own label, so it needed no DNS and connected STRAIGHT TO THE VPS, around Cloudflare. That is
+     what it was for, and it is exactly why it had to go: once the origin sits behind a proxy, a
+     name that bypasses the proxy is not a fallback, it is the hole in the wall. It also handed the
+     raw IP to every visitor, which made putting anything in front of the origin decorative.
+
+     Two proxied names remain and failover still works — every path here is driven by
+     _rrHosts.length, and the `_rrHosts.length < 2` guard is satisfied. A third can be pushed from
+     the server if one is ever needed: extraHosts is append-only and requires no rebuild.
+
+     Note for whoever reads this next: the remaining names are NOT secret and cannot be made so.
+     A browser has to be told where to connect, so the address shows in the Network tab whatever
+     the source looks like — encrypting it only hides the key in the same file. What protects the
+     origin is who is allowed through, not where it is. */
+var _rrHosts     = [RR_PRIMARY, RR_FALLBACK];
 var _rrHostIdx   = 0;
 var _rrHostFails = 0;
 var _rrCycles    = 0;            // how many times we have been all the way round the list
