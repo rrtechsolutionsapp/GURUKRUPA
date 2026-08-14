@@ -5176,7 +5176,19 @@ var RR_FALLBACK  = 'live.rrjewellersetawah.in';       // same server, second nam
      A browser has to be told where to connect, so the address shows in the Network tab whatever
      the source looks like — encrypting it only hides the key in the same file. What protects the
      origin is who is allowed through, not where it is. */
-var _rrHosts     = [RR_PRIMARY, RR_FALLBACK];
+/* RR_CF IS A DIFFERENT ROUTE, NOT A THIRD SPELLING OF THE SAME ONE. The two names above both
+   resolve to the origin's own address, so a network with no path to that address loses BOTH at
+   once -- which is exactly what was measured on 14 Aug 2026: a Jio hotspot could reach the whole
+   internet but not this one IP, and rotating hostnames achieved nothing because every name ended
+   at the same place. cf. is served by Cloudflare, so it reaches the origin across Cloudflare's
+   network instead of the handset's broken path.
+   It is LAST on purpose. Every request that lands on it means the direct path failed, and the
+   server counts those (viaCf) as a fault, not as usage.
+   This is NOT the old sslip.io name returning. That one spelled the raw IP and went AROUND
+   Cloudflare; this one goes THROUGH it. Opposite direction, opposite purpose. */
+var RR_CF        = 'cf.rrjewellersetawah.in';
+var RR_BUILTIN   = [RR_PRIMARY, RR_FALLBACK, RR_CF];   /* baked in; always tried before anything learned */
+var _rrHosts     = RR_BUILTIN.slice();
 var _rrHostIdx   = 0;
 var _rrHostFails = 0;
 var _rrCycles    = 0;            // how many times we have been all the way round the list
@@ -5190,6 +5202,73 @@ function _rrApplyHost() {
   WS_FX  = 'wss://' + h + '/feed/fx';
 }
 _rrApplyHost();
+
+/* THE COLD-START DEADLOCK -- WHY THIS BLOCK EXISTS.
+   The server can teach the app a new hostname through `extraHosts` on /api/rates. But
+   /api/rates is fetched over the host list the app ALREADY has. So the app could only learn a
+   new name on a network where the old names already worked -- and on the one network where the
+   new name was actually needed, it could never arrive. A closed loop.
+   It also failed silently, which is the dangerous part: boot paints the last saved rates, so an
+   app that is permanently stuck still looks like a full, healthy board.
+   Fix: remember what was learned, across a cold start. Three guards, each load-bearing:
+     - the baked-in names always come FIRST and memory only ever ADDS. The worst a corrupted
+       memory can do is cost a few wasted probes; it can never take a shop off air.
+     - re-validate the shape on the way IN. This is the handset's storage, not the server's.
+     - expire after 30 days, or a hostname retired on the server lives forever on the phone and
+       goes on being probed by a fleet nobody can reach. */
+var RR_HOSTS_KEY = 'rr_hosts_v1';
+var RR_HOSTS_TTL = 30 * 24 * 60 * 60 * 1000;
+var RR_HOSTS_MAX = 4;                       /* learned names, over and above the baked-in ones */
+var _rrHostRe = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+
+/* One validator for both callers -- the server's extraHosts and the phone's own memory. Two
+   copies of this test would drift, and the memory copy is the one that must not be trusted. */
+function _rrHostsAdd(list) {
+  var added = 0;
+  if (Object.prototype.toString.call(list) !== '[object Array]') return 0;
+  for (var i = 0; i < list.length && (_rrHosts.length - RR_BUILTIN.length) < RR_HOSTS_MAX; i++) {
+    var h = list[i];
+    if (typeof h !== 'string') continue;
+    h = h.trim().toLowerCase();
+    if (h.length < 4 || h.length > 253) continue;
+    if (!_rrHostRe.test(h)) continue;
+    if (_rrHosts.indexOf(h) >= 0) continue;
+    _rrHosts.push(h);
+    added++;
+  }
+  return added;
+}
+function _rrHostsLoad() {
+  try {
+    var raw = JSON.parse(localStorage.getItem(RR_HOSTS_KEY) || 'null');
+    if (!raw || typeof raw.at !== 'number') return;
+    if (Date.now() - raw.at > RR_HOSTS_TTL) {
+      try { localStorage.removeItem(RR_HOSTS_KEY); } catch (_) {}
+      return;
+    }
+    _rrHostsAdd(raw.h);
+  } catch (_) {}
+}
+function _rrHostsSave() {
+  try {
+    var learned = _rrHosts.slice(RR_BUILTIN.length);
+    if (!learned.length) return;
+    localStorage.setItem(RR_HOSTS_KEY, JSON.stringify({ at: Date.now(), h: learned }));
+  } catch (_) {}
+}
+_rrHostsLoad();
+_rrApplyHost();
+
+/* RACE THE NAMES, DO NOT QUEUE THEM.
+   Connecting walks the list one at a time and only discovers a name is dead by failing against
+   it, so the wait is the SUM of the timeouts: on a network that swallows packets rather than
+   refusing them, two dead names cost about 30 seconds of blank board before the third is even
+   attempted. A /ping is far cheaper than a socket handshake and they can all be in flight at
+   once, so the cost becomes the slowest SINGLE reply instead of the sum.
+   Deferred by one turn so every function this touches is already defined. Harmless when the
+   primary is healthy: _rrProbeAll only moves the app when a LOWER-numbered name answers than
+   the one in use, so a working primary means it does nothing at all. */
+try { setTimeout(function () { try { _rrProbeAll(); } catch (_) {} }, 0); } catch (_) {}
 
 /* COME HOME. Rotation only ever increments and nothing resets it, so without this a phone
    that stumbled once lives on a fallback for the life of the install -- the fallback works,
@@ -5324,20 +5403,10 @@ function _rrApplyTunables(cfg) {
     /* extraHosts: APPEND ONLY, never replace. A knob able to replace the whole list would let one
        typo in the panel put every installed app off air permanently, with an App Store release as
        the only way back. Appending costs, at worst, a few wasted probes. */
-    var ex = t.extraHosts;
-    if (Object.prototype.toString.call(ex) === '[object Array]') {
-      var added = 0;
-      for (var i = 0; i < ex.length && added < 4; i++) {
-        var h = ex[i];
-        if (typeof h !== 'string') continue;
-        h = h.trim().toLowerCase();
-        if (h.length < 4 || h.length > 253) continue;
-        if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(h)) continue;
-        if (_rrHosts.indexOf(h) >= 0) continue;
-        _rrHosts.push(h);
-        added++;
-      }
-    }
+    /* ...and now REMEMBERED, so the name survives the app being killed. Without that the whole
+       mechanism was unreachable on the only networks that needed it -- see the deadlock note
+       where the host list is declared. */
+    if (_rrHostsAdd(t.extraHosts)) _rrHostsSave();
     try { diag({ type: 'tunables', applied: _rrTuned, hosts: _rrHosts.length }); } catch (e) {}
   } catch (e) {}
 }
