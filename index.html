@@ -148,6 +148,24 @@ html{font-size:14px;-webkit-text-size-adjust:100%;text-size-adjust:100%;}body{ba
 @keyframes rrFall { from { transform: translate3d(0,0,0); }
                      to   { transform: translate3d(0%,50%,0); } }
 
+/* PERF — THE SKY DOES NOT EXIST UNTIL THE SPLASH HAS GONE.
+   Both sky layers are 200% of the viewport's height — 1920x2160 each on a 1080p screen — and
+   each carries dozens of stacked radial gradients. Together with the splash's own dust layer and
+   the fourteen sparkles, that is a lot of separately composited surface being rasterised and
+   uploaded at the one moment the machine is busiest: while the page is opening.
+   And for that whole time they sit behind an opaque, full-screen #splash. Nobody sees any of it.
+   Why this shows on a Windows laptop and not a Mac is not raw power — a gaming laptop has
+   plenty. It is that when the compositor's memory budget is exhausted, Chrome stops compositing
+   animations and runs them on the main thread instead. From that moment every script block
+   during load freezes the logo. That is what "the splash stutters" is.
+   `display:none`, not `opacity:0`, because opacity:0 still rasterises. Switched on when the
+   splash actually leaves — see the dismissal. */
+html:not(.rr-sky-on) .rr-sky{ display:none !important; }
+/* And `will-change` earns its keep HERE, unlike on the sky: splashPop scales this image and its
+   easing overshoots past 1.0, so without the hint Chrome re-rasters it as the scale changes.
+   Small element, immediate animation, short life. No other rule sets will-change on it, so the
+   position of this line in the cascade does not matter. */
+#splash img, #splash .splash-logo{ will-change:transform; }
 .rr-sky{
   position:absolute;inset:0;z-index:-1;pointer-events:none;overflow:hidden;
   transform:translate3d(var(--rr-px,0px),var(--rr-py,0px),0);
@@ -6423,13 +6441,24 @@ try {
 } catch(e){}
 
 /* Dismiss splash — faster since cached data already visible */
+/* Turning the ambient sky on is tied to the splash ACTUALLY LEAVING — not to a timer, and not
+   to requestIdleCallback. The first attempt used requestIdleCallback and it fired at 33ms, before
+   the splash had even painted: the main thread is genuinely idle early while it waits for the
+   network, so "idle" is not the same question as "is the splash gone". Measured, then rewritten.
+   Idempotent, and reachable by three routes on purpose, because this sits deep inside an inline
+   script and a throw anywhere above it would otherwise leave the sky off for the life of the
+   page: the normal dismissal, the no-splash case, and a plain 6s backstop. */
+var _rrSkyOn = function () { try { document.documentElement.classList.add('rr-sky-on'); } catch (_) {} };
 setTimeout(function() {
   var sp = document.getElementById("splash");
   if (sp) {
     sp.classList.add("hide");
-    setTimeout(function(){ sp.style.display="none"; }, 480);
+    setTimeout(function(){ sp.style.display="none"; _rrSkyOn(); }, 480);
+  } else {
+    _rrSkyOn();
   }
 }, 400);
+setTimeout(_rrSkyOn, 6000);
 
 setInterval(tickClock, 1000);
 
