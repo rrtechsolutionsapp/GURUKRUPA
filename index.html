@@ -5393,6 +5393,7 @@ var _rrTuneSpec = {
   prodHostSwitchAfter: { min: 1,     max: 10 },
   homeProbeMs:         { min: 30000, max: 3600000 },
   rateStaleMs:         { min: 5000,  max: 300000 },
+  mcxPipeStaleMs:      { min: 5000,  max: 300000 },   /* §4 — how long MCX may be silent and still count as LIVE */
   liveMaxAgeMs:        { min: 3000,  max: 300000 },
   restFreshMs:         { min: 5000,  max: 300000 },
   zombieMs:            { min: 10000, max: 600000 },
@@ -6060,6 +6061,24 @@ function updateBadgeState() {
   var rateAge = _lastRateUpdate > 0 ? Date.now() - _lastRateUpdate : Infinity;
   var wsAlive = mcxOk || fxOk;
 
+  /* THE BADGE USED TO LIE, AND THIS IS THE MOST EXPENSIVE THING IT COULD HAVE DONE.
+     `rateAge` above is the age of the last rate of ANY kind — and the FX socket refreshes it
+     too. FX is the MT5 forex feed: a completely separate upstream that runs 24/5 and keeps
+     ticking long after MCX has stopped. So if the gold pipe died while FX carried on, rateAge
+     stayed small, the badge stayed green, and a jeweller quoted a frozen gold price to a
+     customer on the strength of it.
+     The honest test needs BOTH halves: some rate data is fresh, AND MCX's own pipe is alive.
+     `_lastMcxWsData` is the right signal for the second because it is set on EVERY MCX frame,
+     heartbeats included — not only when a price actually moves. That distinction matters: in a
+     quiet market a price can sit flat for five minutes, and keying off price CHANGES would
+     print a false STALE on a perfectly healthy feed.
+     20s is deliberate headroom, not a guess: the server sends an MCX heartbeat every 5s when
+     there is no tick, and the longest gap measured on a healthy socket was 1001ms. So this is
+     four heartbeats, or twenty times the worst gap actually seen. Server-tunable by name in
+     case a shop's network needs it looser. */
+  var mcxPipeAge  = _lastMcxWsData > 0 ? Date.now() - _lastMcxWsData : Infinity;
+  var mcxPipeLive = mcxPipeAge <= tune('mcxPipeStaleMs', 20000);
+
   // Suppress RECONNECTING/OFFLINE for first 2s of disconnect — hot-swap usually completes in <50ms.
   // Only show RECONNECTING when disconnect persists beyond what hot-swap can mask.
   if (!wsAlive) { if (_disconnectedSince === 0) _disconnectedSince = Date.now(); }
@@ -6089,6 +6108,12 @@ function updateBadgeState() {
   } else if (tokenIssue && _mktOpen) {
     newState = 'token';
   } else if (serverDown && _mktOpen && !suppressDisc) {
+    newState = 'reconnecting';
+  } else if (_mktOpen && !mcxPipeLive && !suppressDisc) {
+    /* §4. Whatever FX is doing, the gold pipe has gone quiet — so this is RECONNECTING, which
+       is the truth, and not LIVE, which is what it used to say. Placed ABOVE the rateAge tests
+       on purpose: those read the FX-contaminated clock and would otherwise let a dead MCX pipe
+       fall straight through into 'live'. */
     newState = 'reconnecting';
   } else if (_mktOpen && rateAge > 20000 && !suppressDisc) {
     newState = 'reconnecting';
