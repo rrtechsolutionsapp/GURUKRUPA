@@ -5394,6 +5394,8 @@ var _rrTuneSpec = {
   homeProbeMs:         { min: 30000, max: 3600000 },
   rateStaleMs:         { min: 5000,  max: 300000 },
   mcxPipeStaleMs:      { min: 5000,  max: 300000 },   /* §4 — how long MCX may be silent and still count as LIVE */
+  mcxRateStaleMs:      { min: 60000, max: 3600000 },  /* gold price frozen this long on an open market = a fault */
+  fxPipeStaleMs:       { min: 5000,  max: 600000 },   /* forex bridge silent this long = dim the spot row */
   liveMaxAgeMs:        { min: 3000,  max: 300000 },
   restFreshMs:         { min: 5000,  max: 300000 },
   zombieMs:            { min: 10000, max: 600000 },
@@ -5470,6 +5472,136 @@ function _rrNoteFailure() {
 function _rrNoteSuccess() { _rrHostFails = 0; }
 /* ══ END HOST FAILOVER ══ */
 
+/* ══ THE APP REPORTS ITS OWN TROUBLE ══════════════════════════════════════════════════════
+   Spec §5. Until now an error on a customer's phone died inside that phone: the app could be
+   broken in a shop for a week and nobody would know, because the only person who could see it
+   was the one person not looking.
+
+   And the important half is NOT crashes. This app's real failure is that it STICKS — the board
+   stops updating and no exception is ever thrown. A crash-only reporter would have stayed
+   silent through exactly the fault we care about, which also meant the server's self-heal, which
+   triggers on `socket`/`offline` reports, could never fire in real life. So the watchdog reports
+   being stuck as an event in its own right; see _rrHealthTick.
+
+   Five locks, because a reporter that misbehaves is worse than no reporter:
+     - at most 6 in a session
+     - the same message at most once per 10 minutes
+     - fire and forget: this must never sit in front of a rate reaching the screen
+     - silent until the client id and a host are known, i.e. silent before boot
+     - silent when the device says it is offline — nobody is listening anyway
+
+   The .catch() is load-bearing, not decoration: without it a failed report rejects, the
+   unhandledrejection handler below calls applog again, and the reporter feeds itself. */
+var RR_LOG_MAX = 6, RR_LOG_DEDUP_MS = 10 * 60 * 1000;
+var _rrLogSent = 0, _rrLogSeen = {};
+function applog(kind, message) {
+  try {
+    if (_rrLogSent >= RR_LOG_MAX) return;
+    if (navigator.onLine === false) return;
+    var cid = window.__rrClientId;
+    if (!cid) return;
+    if (typeof SERVER !== 'string' || !SERVER) return;
+    var msg = String(message == null ? '' : message).slice(0, 300);
+    var key = kind + '|' + msg, now = Date.now();
+    if (_rrLogSeen[key] && (now - _rrLogSeen[key]) < RR_LOG_DEDUP_MS) return;
+    _rrLogSeen[key] = now;
+    _rrLogSent++;
+    var url = SERVER + '/applog?c=' + encodeURIComponent(cid) +
+              '&k=' + encodeURIComponent(kind) +
+              '&m=' + encodeURIComponent(msg) +
+              '&v=' + encodeURIComponent(window.__rrAppVersion || '');
+    /* keepalive, because the most valuable report of all is the one sent immediately before a
+       self-reload — without it the navigation cancels the request and the reason is lost. */
+    fetch(url, { mode: 'no-cors', cache: 'no-store', keepalive: true }).catch(function () {});
+  } catch (_) {}
+}
+window.addEventListener('error', function (e) {
+  try {
+    var where = e && e.filename ? String(e.filename).slice(-40) : '?';
+    applog('js', ((e && e.message) || 'error') + ' @' + where + ':' + ((e && e.lineno) || 0));
+  } catch (_) {}
+});
+window.addEventListener('unhandledrejection', function (e) {
+  try {
+    var r = e && e.reason;
+    applog('promise', (r && (r.message || String(r))) || 'rejection');
+  } catch (_) {}
+});
+
+/* ══ STUCK IS AN EVENT, AND THEN A LAST RESORT ════════════════════════════════════════════
+   Spec §5 and §7. Called once per watchdog tick, so every 5s. */
+var _rrTroubleSince = 0, _rrLastTickAt = 0;
+var RR_RELOAD_KEY = 'rr_reload_at';
+
+function _rrHealthTick() {
+  try {
+    var now = Date.now();
+    /* TIME NOBODY MEASURED IS NOT EVIDENCE OF TROUBLE.
+       The watchdog returns early while the app is backgrounded, and iOS suspends the page
+       outright, so this function can stop running for hours with the trouble clock still armed.
+       Without this line, a phone that saw ten seconds of RECONNECTING and was then locked
+       overnight would come back, find a stuck time of fourteen hours, and fire both the report
+       and the self-reload on the FIRST tick after unlocking — about five seconds in, while the
+       ordinary reconnect was still in flight and would have succeeded on its own. The four-minute
+       last resort would not have been shortened; it would have been skipped.
+       A gap larger than three ticks means we were not watching. Start the clock again. */
+    if (_rrLastTickAt && (now - _rrLastTickAt) > 15000) _rrTroubleSince = 0;
+    _rrLastTickAt = now;
+
+    var bad = (_connState === 'offline' || _connState === 'reconnecting');
+    /* KNOWN closed, not merely "not known open". _mktOpen starts false and ONLY an MCX frame can
+       raise it, so a device where MCX never connects at all would sit at false for ever — and
+       gating on it directly made this whole mechanism silent in precisely the situation it was
+       written for. We stand down only once MCX has actually told us the market is shut. */
+    var mktKnownClosed = (_lastMcxFrameAt > 0 && !_mktOpen);
+    if (!bad || mktKnownClosed) { _rrTroubleSince = 0; return; }
+    if (_rrTroubleSince === 0) { _rrTroubleSince = now; return; }
+    var stuckMs = now - _rrTroubleSince;
+
+    if (stuckMs >= 90000) {
+      var mcxUp = !!(_wsMCX && _wsMCX.readyState === 1);
+      var fxUp  = !!(_wsFX  && _wsFX.readyState  === 1);
+      /* Deliberately no elapsed-seconds in this string. It is the dedup key, and a number that
+         grows every tick would defeat the 10-minute lock and burn the session's whole budget of
+         six reports in half a minute. Sockets open but the badge still bad means the pipe is
+         wedged rather than absent, which is a different fault, so the kind differs. */
+      applog(mcxUp || fxUp ? 'socket' : 'offline',
+             'stuck ' + _connState + ' mcx=' + (mcxUp ? 1 : 0) + ' fx=' + (fxUp ? 1 : 0) +
+             ' host=' + (_rrHosts[_rrHostIdx % _rrHosts.length] || '?'));
+    }
+
+    if (stuckMs >= 240000) _rrMaybeReload(stuckMs);
+  } catch (_) {}
+}
+
+/* Everything else has already been tried by the time this runs — host rotation, the walk home,
+   zombie detection, the wedged-socket timeout, the REST fallback. Reloading is the blunt last
+   instrument, and there is nothing worse it could do than loop, so it is fenced three ways:
+
+     - once per 30 minutes, and that memory lives on DISK. In memory it would be erased by the
+       very reload it is meant to limit, which is the trap this guard exists for.
+     - the timestamp is written and then READ BACK. A device that cannot remember this — private
+       mode, a full or disabled store — would reload every four minutes for as long as it is
+       switched on. If the memory does not hold, we do not reload at all.
+     - only with the app in front of someone and the market open. Reloading a backgrounded app
+       helps nobody and costs a reconnect. */
+function _rrMaybeReload(stuckMs) {
+  try {
+    if (document.visibilityState !== 'visible') return;
+    if (!_mktOpen) return;
+    var now = Date.now(), prev = 0;
+    try { prev = parseInt(localStorage.getItem(RR_RELOAD_KEY) || '0', 10) || 0; }
+    catch (_) { return; }
+    if (now - prev < 30 * 60 * 1000) return;
+    try {
+      localStorage.setItem(RR_RELOAD_KEY, String(now));
+      if (parseInt(localStorage.getItem(RR_RELOAD_KEY) || '0', 10) !== now) return;
+    } catch (_) { return; }
+    applog('stale', 'self-reload after ' + Math.round(stuckMs / 60000) + 'min stuck');
+    try { location.reload(); } catch (_) {}
+  } catch (_) {}
+}
+
 // State - merged from both WS channels
 var state = {};
 var _rafPending = false;
@@ -5528,6 +5660,28 @@ function mergeAndRender(patch) {
 // -- MCX WebSocket — single-WS baseline (hot-swap reverted for forensic clarity) --
 var _lastWsData = 0;       // any WS data (MCX or FX) — used by zombie detection
 var _lastMcxWsData = 0;    // MCX-specific data — used by MCX zombie detection
+/* FOUR CLOCKS, NOT ONE, AND THE DIFFERENCE IS THE WHOLE POINT.
+   There are two upstreams behind this board and they have nothing to do with each other: MCX is
+   the Indian gold/silver futures feed and keeps exchange hours; FX is an MT5 forex bridge that
+   runs 24/5. Reading them off one shared clock produced a lie in each direction — a dead gold
+   feed hiding behind a live forex one, and a perfectly healthy board reported as broken merely
+   because gold had not moved for a few minutes.
+   So each feed gets a PIPE clock and a PRICE clock, and they answer different questions:
+     pipe  — "is this feed connected?"  Set by every frame, heartbeats included.
+     price — "when did this number last change?"  Set only by real price frames.
+   Connection state must be read off the pipes. Value freshness must be read off the prices. */
+var _lastMcxRate  = 0;    // last GOLD price frame
+/* And a FRAMES-ONLY tracker, which is not the same thing as _lastMcxWsData above.
+   _lastMcxWsData is also stamped when the socket merely OPENS, on purpose, so that a freshly
+   reconnected socket is not immediately killed by the zombie check before its first heartbeat.
+   That stamp is right for the zombie timer and wrong for the badge: a server that accepts the
+   upgrade and then hangs up without sending anything makes the app reconnect in a tight loop —
+   onopen also resets the retry counter, so the backoff never grows — and every one of those
+   opens would refresh the clock the badge trusts. The badge would then read a healthy pipe while
+   not one gold frame had ever arrived. Only real frames touch this one. */
+var _lastMcxFrameAt = 0;  // MCX FRAMES only — never stamped on socket open
+var _lastFxWsData = 0;    // FX pipe health — every FX frame, heartbeats too
+var _lastFxRate   = 0;    // last FOREX price frame
 var _wsMCX = null;
 var _mcxRetry = 0, _mcxReconnectTimer = null;
 var _mcxConnAt = 0; // for diag overlay
@@ -5579,6 +5733,7 @@ function connectMCX() {
       if (!d) return;
       _lastWsData = Date.now();
       _lastMcxWsData = Date.now();
+      _lastMcxFrameAt = Date.now();   /* a real frame, not merely an open socket */
       // WEBSOCKET-READY product pipeline (dormant until the backend pushes 'rates' frames):
       // route realtime shop-rate payloads through the SAME diff-based renderer as the REST poll.
       if ((d.t === 'rates' || d.rates) && window.__rtRates) { window.__rtRates(d); if (d.t === 'rates') return; }
@@ -5600,6 +5755,10 @@ function connectMCX() {
         return;
       }
       _lastRateUpdate = Date.now();
+      /* A GOLD price, specifically. _lastRateUpdate above is shared with FX and therefore cannot
+         answer "when did gold last move"; this can. Set here, after the hb/beat returns, so a
+         heartbeat never counts as a price. */
+      _lastMcxRate = Date.now();
       pulseReceived();
       if (d.t === 'snap' || d.t === 'full') {
         if (d.mktOpen !== undefined) _mktOpen = d.mktOpen;
@@ -5711,8 +5870,13 @@ function connectFX() {
       var d = JSON.parse(raw);
       if (!d) return;
       _lastWsData = Date.now();
+      /* The FX pipe's own health, mirroring _lastMcxWsData: set on EVERY frame including the
+         heartbeat, because a socket that is heartbeating is a socket that is alive whether or
+         not the forex price happens to be moving. */
+      _lastFxWsData = Date.now();
       if (d.t === 'hb') { return; }
       _lastRateUpdate = Date.now();
+      _lastFxRate = Date.now();   /* a FOREX price, specifically */
       pulseReceived();
       if (d.t === 'fx' || d.t === 'snap') {
         if (d.lastUpdate > 0) _lastFxUpdate = d.lastUpdate; // for "Last Updated" when market closed
@@ -5940,24 +6104,40 @@ var _serverDhanPkts = 0; // upstream Dhan packet count (from beat)
 var _serverTickAge = null;// upstream Dhan tickAge (from beat)
 var _connState = 'init';
 var _staleApplied = false;
-var _staleValueIds = [
+/* Split by the feed that actually supplies each number. Dimming everything together meant the
+   dollar spot row went grey because gold had gone quiet, and — worse — the gold row stayed bright
+   while the forex bridge was down. Each group now answers for its own pipe. */
+var _staleValueIdsMcx = [
   'p-gold','p-silver',
   'fg-bid','fg-ask','fg-h','fg-l','fs-bid','fs-ask','fs-h','fs-l',
-  'fgn-bid','fgn-ask','fgn-h','fgn-l','fsn-bid','fsn-ask','fsn-h','fsn-l',
+  'fgn-bid','fgn-ask','fgn-h','fgn-l','fsn-bid','fsn-ask','fsn-h','fsn-l'
+];
+var _staleValueIdsFx = [
   'sg-bid','sg-ask','sg-h','sg-l','ss-bid','ss-ask','ss-h','ss-l',
   'si-bid','si-ask','si-h','si-l'
 ];
+var _staleValueIds = _staleValueIdsMcx.concat(_staleValueIdsFx);   /* kept for any other reader */
 
-function applyStaleClass(on) {
-  if (on === _staleApplied) return;
-  _staleApplied = on;
-  for (var i = 0; i < _staleValueIds.length; i++) {
-    var el = $(_staleValueIds[i]);
+var _staleAppliedMcx = null, _staleAppliedFx = null;
+function _rrSetStale(ids, on, was) {
+  if (on === was) return was;
+  for (var i = 0; i < ids.length; i++) {
+    var el = $(ids[i]);
     if (el) {
       if (on) el.classList.add('stale-val');
       else    el.classList.remove('stale-val');
     }
   }
+  return on;
+}
+/* Two arguments now. Called with one, both groups follow it — which is what the boot-time
+   applyStaleClass(false) wants, and keeps any other caller honest. */
+function applyStaleClass(mcxStale, fxStale) {
+  if (arguments.length < 2) fxStale = mcxStale;
+  mcxStale = !!mcxStale; fxStale = !!fxStale;
+  _staleAppliedMcx = _rrSetStale(_staleValueIdsMcx, mcxStale, _staleAppliedMcx);
+  _staleAppliedFx  = _rrSetStale(_staleValueIdsFx,  fxStale,  _staleAppliedFx);
+  _staleApplied = mcxStale && fxStale;
 }
 
 // Smart market-status banner — driven ENTIRELY by backend session engine.
@@ -6076,8 +6256,15 @@ function updateBadgeState() {
      there is no tick, and the longest gap measured on a healthy socket was 1001ms. So this is
      four heartbeats, or twenty times the worst gap actually seen. Server-tunable by name in
      case a shop's network needs it looser. */
-  var mcxPipeAge  = _lastMcxWsData > 0 ? Date.now() - _lastMcxWsData : Infinity;
+  var mcxPipeAge  = _lastMcxFrameAt > 0 ? Date.now() - _lastMcxFrameAt : Infinity;
   var mcxPipeLive = mcxPipeAge <= tune('mcxPipeStaleMs', 20000);
+  /* The forex bridge answers for itself the same way. Note it is NOT allowed to influence the
+     LIVE decision — this badge speaks for the gold feed, which is what a jeweller quotes from.
+     It only decides whether the dollar spot row is dimmed. */
+  var fxPipeAge   = _lastFxWsData > 0 ? Date.now() - _lastFxWsData : Infinity;
+  var fxPipeLive  = fxPipeAge <= tune('fxPipeStaleMs', 60000);
+  /* And the gold PRICE clock, which is a different question from the gold PIPE clock. */
+  var mcxRateAge  = _lastMcxRate > 0 ? Date.now() - _lastMcxRate : Infinity;
 
   // Suppress RECONNECTING/OFFLINE for first 2s of disconnect — hot-swap usually completes in <50ms.
   // Only show RECONNECTING when disconnect persists beyond what hot-swap can mask.
@@ -6115,14 +6302,24 @@ function updateBadgeState() {
        on purpose: those read the FX-contaminated clock and would otherwise let a dead MCX pipe
        fall straight through into 'live'. */
     newState = 'reconnecting';
-  } else if (_mktOpen && rateAge > 20000 && !suppressDisc) {
-    newState = 'reconnecting';
+  } else if (_mktOpen && mcxRateAge > tune('mcxRateStaleMs', 600000) && !suppressDisc) {
+    /* The pipe is alive (checked above) yet gold has not moved in ten minutes of an open market.
+       A quiet market explains a few minutes — measured at up to five — but not this, so it is
+       reported rather than shown as LIVE.
+       This replaced a twenty-second test on the SHARED rate clock, which was wrong twice over:
+       FX refreshes that clock too, so it never fired when it should have — and had FX gone quiet
+       at the same moment, it would have called a perfectly healthy board broken in 20 seconds. */
+    newState = 'stale';
   } else if (_mktOpen && rateAge <= tune('liveMaxAgeMs', 15000)) {
     newState = 'live';
   } else if (_mktOpen) {
     newState = suppressDisc ? 'live' : 'stale'; // hold LIVE during hot-swap window
   } else {
-    newState = rateAge < tune('closedLiveMs', 120000) ? 'live' : 'closed';
+    /* mcxRateAge, not the shared clock. This branch runs whenever _mktOpen is false — which
+       includes the case where MCX has NEVER connected, because only an MCX frame can raise that
+       flag. On the shared clock a healthy forex feed alone kept this reading 'live', so the very
+       lie §4 set out to kill walked back in through the closed-market door. */
+    newState = mcxRateAge < tune('closedLiveMs', 120000) ? 'live' : 'closed';
   }
 
   // Fade stale values when data is old >20s — but ONLY while the market is OPEN.
@@ -6130,7 +6327,11 @@ function updateBadgeState() {
   // numbers ARE the correct last traded values, not stale data: dimming them to 0.35 opacity
   // made the whole app look broken for the entire weekend. Only fade when we EXPECT fresh
   // ticks and aren't getting them.
-  applyStaleClass(_mktOpen && rateAge > 20000 && newState !== 'live');
+  /* Dim on the PIPES, not on the prices. A number that has not changed is not a number you
+     cannot trust — in a quiet market it is exactly right, and greying it out tells the shop a
+     lie about its own board. A pipe that has stopped delivering is the real thing to show, and
+     each half of the board now answers for its own. */
+  applyStaleClass(_mktOpen && !mcxPipeLive, _mktOpen && !fxPipeLive);
 
   if (newState === _connState) return;
   _connState = newState;
@@ -6228,6 +6429,7 @@ setInterval(function() {
   else if (rateAge > tune('rateStaleMs', 20000) && _mktOpen) { fetchREST(); }
   // Update badge state every cycle
   updateBadgeState();
+  _rrHealthTick();   /* §5/§7 — report being stuck, and reload as a last resort */
 }, 5000);
 
 // ── Client-side keepalive ────────────────────────────────────────────────
@@ -6518,6 +6720,10 @@ document.addEventListener('visibilitychange', function(){
   // cadence is taken from the tenant's uiRefreshMs (Super-Admin) on the first /api/rates response.
   // Live MCX/FX market spot is already WebSocket-driven (not polled), so this stays battery-friendly.
   var CFG = { base: "https://rrjewellersetawah.in", clientId: "gurukrupa", pollMs: 5000, enabled: true };
+  /* applog needs the shop id, and this is the only place it exists. Publishing it here 
+     also gives §5 its "silent before boot" rule for free: until this line has run there 
+     is no id, and applog refuses to send. */
+  try { window.__rrClientId = CFG.clientId; } catch (_) {}
   if (!CFG.enabled) return;
 
   function inr(n) {
