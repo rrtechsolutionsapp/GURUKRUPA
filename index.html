@@ -324,6 +324,32 @@ html.dark-mode .rr-sky-if{ background-image:radial-gradient(1.9px 1.9px at 1.7% 
   .hdr-brand,.hdr-logo,.brandlogo{ transition:none !important; }
 }
 /* ══ END MOTION POLISH ══ */
+
+/* ══ REDUCED MOTION — ALL OF IT, NOT JUST THE DECORATION ═══════════════════════════════
+   Two blocks above already switch off the ambient sky, the splash dust, the comet and the
+   ripple. That still left the ticker scrolling, the card shine sweeping, the live dot
+   blinking, the tiles drifting and every entrance animation moving. An app claiming to
+   honour this setting while most of its screen was still in motion would be claiming
+   something untrue, and this declaration goes on the product page for people who rely on it.
+
+   The obvious fix — `animation: none` on everything — is a trap, and a worse one than the
+   problem. fadeUp, splashPop, dakIn and pgIn all START at opacity:0; the animation is what
+   MAKES the element visible. Removing it removes the content, for precisely the users who
+   asked for less movement.
+
+   So nothing is removed. Everything is FINISHED INSTANTLY instead: one iteration, ~0
+   duration. Every animation lands on its end state in the first frame and stays there —
+   entrances still reveal, loops stop after one instant pass, transitions snap.
+   Delays are deliberately untouched: a delay is a wait, not a movement, and the splash
+   failsafe depends on its 5s one. */
+@media (prefers-reduced-motion: reduce){
+  *, *::before, *::after{
+    animation-duration:1ms !important;
+    animation-iteration-count:1 !important;
+    transition-duration:1ms !important;
+    scroll-behavior:auto !important;
+  }
+}
 /* ══ FEATURES ABC ═══════════════════════════════════════════════════════════════════
 
 /* ── A. HOLD A RATE STILL ─────────────────────────────────────────────────────
