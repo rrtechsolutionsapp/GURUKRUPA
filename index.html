@@ -5532,15 +5532,89 @@ function applog(kind, message) {
     if (_rrLogSeen[key] && (now - _rrLogSeen[key]) < RR_LOG_DEDUP_MS) return;
     _rrLogSeen[key] = now;
     _rrLogSent++;
-    var url = SERVER + '/applog?c=' + encodeURIComponent(cid) +
-              '&k=' + encodeURIComponent(kind) +
-              '&m=' + encodeURIComponent(msg) +
-              '&v=' + encodeURIComponent(window.__rrAppVersion || '');
-    /* keepalive, because the most valuable report of all is the one sent immediately before a
-       self-reload — without it the navigation cancels the request and the reason is lost. */
-    fetch(url, { mode: 'no-cors', cache: 'no-store', keepalive: true }).catch(function () {});
+    _rrLogDeliver(cid, kind, msg, now);
   } catch (_) {}
 }
+
+/* §6 — EVERY HOST, NOT JUST THE FIRST.
+   The app moves between hostnames because a name going dark has been this year's single biggest
+   fault. Sending diagnostics to only the current host meant the reporter fell silent in exactly
+   the situation it exists for: the app is in trouble BECAUSE that name stopped answering.
+   First host that answers wins. All of them failing is not an error — this is a diagnostic, and
+   nothing here may ever hold up a rate reaching the screen. It is queued instead; see below.
+
+   §4 — the age travels in its OWN parameter, never inside the message. Appending "[5m ago]" to
+   the text changes the text, and the server's dedup hash is built from the text — so every
+   different delay became a different hash, dedup collapsed, and the "seen N times" count that
+   distinguishes ONE phone from SEVENTY scattered into fragments. Whatever varies must stay out
+   of the field that dedup is computed on. */
+function _rrLogDeliver(cid, kind, msg, stampedAt) {
+  var hosts = (typeof _rrHosts !== 'undefined' && _rrHosts.length) ? _rrHosts.slice() : [];
+  if (!hosts.length) { _rrLogQueuePush(kind, msg, stampedAt); return; }
+  var ageMin = Math.max(0, Math.round((Date.now() - stampedAt) / 60000));
+  var qs = '/applog?c=' + encodeURIComponent(cid) +
+           '&k=' + encodeURIComponent(kind) +
+           '&m=' + encodeURIComponent(msg) +
+           '&a=' + ageMin +
+           '&v=' + encodeURIComponent(window.__rrAppVersion || '');
+  var i = 0;
+  (function next() {
+    if (i >= hosts.length) { _rrLogQueuePush(kind, msg, stampedAt); return; }
+    var h = hosts[i++];
+    /* keepalive matters most for the report sent immediately before a self-reload — without it
+       the navigation cancels the request and the reason for the reload is lost.
+       no-cors resolves on reaching the server and rejects only on a network failure, which is
+       exactly the distinction wanted here: a 4xx still means we got there. */
+    try {
+      fetch('https://' + h + qs, { mode: 'no-cors', cache: 'no-store', keepalive: true })
+        .then(function () {}, next);
+    } catch (_) { next(); }
+  })();
+}
+
+/* §4 — WHAT COULD NOT BE SENT IS KEPT, AND SENT LATER WITH ITS REAL TIME.
+   Reporting runs over the very network it is complaining about, so the reports that matter most
+   are the ones that cannot get out. Five rules, each earned:
+     - at most 5. Piling up on an offline phone helps nobody; the FIRST report of an episode says
+       the most.
+     - nothing older than 24h. Nothing can be done about it any more; it is only noise.
+     - the store is CLEARED BEFORE sending, not after. A queue that is drained on success only
+       re-sends itself for ever on every boot if the send keeps failing — worse than losing it.
+     - the dedup stamp is applied when queueing too, or the same message climbs back on every tick.
+     - the ORIGINAL time is carried, so age is measured from when it happened. Re-stamping on each
+       attempt resets the age to 0 every time and the 24h rule can then never fire. */
+var RR_LOGQ_KEY = 'rr_logq_v1', RR_LOGQ_MAX = 5, RR_LOGQ_TTL = 24 * 60 * 60 * 1000;
+function _rrLogQueuePush(kind, msg, stampedAt) {
+  try {
+    var q = JSON.parse(localStorage.getItem(RR_LOGQ_KEY) || '[]');
+    if (Object.prototype.toString.call(q) !== '[object Array]') q = [];
+    q.push({ k: kind, m: msg, t: stampedAt || Date.now() });
+    if (q.length > RR_LOGQ_MAX) q = q.slice(-RR_LOGQ_MAX);
+    localStorage.setItem(RR_LOGQ_KEY, JSON.stringify(q));
+  } catch (_) {}
+}
+function _rrLogQueueFlush() {
+  try {
+    var raw = localStorage.getItem(RR_LOGQ_KEY);
+    if (!raw) return;
+    var q = JSON.parse(raw);
+    if (Object.prototype.toString.call(q) !== '[object Array]' || !q.length) return;
+    try { localStorage.removeItem(RR_LOGQ_KEY); } catch (_) {}   /* clear FIRST — see above */
+    var cid = window.__rrClientId;
+    if (!cid) return;
+    var now = Date.now();
+    for (var i = 0; i < q.length; i++) {
+      var e = q[i];
+      if (!e || typeof e.m !== 'string') continue;
+      if (!e.t || (now - e.t) > RR_LOGQ_TTL) continue;            /* too old to act on */
+      var key = e.k + '|' + e.m;
+      if (_rrLogSeen[key] && (now - _rrLogSeen[key]) < RR_LOG_DEDUP_MS) continue;
+      _rrLogSeen[key] = now;
+      _rrLogDeliver(cid, e.k, e.m, e.t);
+    }
+  } catch (_) {}
+}
+try { window.addEventListener('online', function () { setTimeout(_rrLogQueueFlush, 1200); }); } catch (_) {}
 window.addEventListener('error', function (e) {
   try {
     var where = e && e.filename ? String(e.filename).slice(-40) : '?';
@@ -5557,6 +5631,27 @@ window.addEventListener('unhandledrejection', function (e) {
 /* ══ STUCK IS AN EVENT, AND THEN A LAST RESORT ════════════════════════════════════════════
    Spec §5 and §7. Called once per watchdog tick, so every 5s. */
 var _rrTroubleSince = 0, _rrLastTickAt = 0;
+/* §8 — "NEVER CONNECTED" IS ITS OWN QUESTION, AND IT CANNOT BE ASKED THROUGH _mktOpen.
+   Every other check here stands down when the market is shut — and _mktOpen is a flag that ONLY
+   the server can raise. So for an app that never reached the server at all, the market was
+   permanently "closed" and the whole detector stayed switched off: silent in precisely the case
+   it was built for.
+   This one asks nothing of the server. It fires once, 90s after boot, and only then.
+   BOTH clocks are required, not just REST. A boot request still in flight makes the
+   socket-onopen retry drop, which can leave the REST clock at 0 on an app that is running
+   perfectly well — so "REST never succeeded" alone would report a healthy board. It must also be
+   true that not one byte ever arrived over either socket. */
+var _rrBootAt = Date.now(), _rrNeverToldOnce = false;
+function _rrCheckNeverConnected() {
+  try {
+    if (_rrNeverToldOnce) return;
+    if (Date.now() - _rrBootAt < 90000) return;
+    if (_lastRestOk > 0) return;                 /* REST has worked at least once */
+    if (_lastWsData > 0) return;                 /* something arrived on some socket */
+    _rrNeverToldOnce = true;
+    applog('boot', 'no server contact 90s after launch; hosts=' + ((typeof _rrHosts !== 'undefined') ? _rrHosts.length : 0));
+  } catch (_) {}
+}
 var RR_RELOAD_KEY = 'rr_reload_at';
 
 function _rrHealthTick() {
@@ -6007,7 +6102,10 @@ function onNativeResume() {
   // This prevents unnecessary socket churn on brief pauses (notification shade, app switcher).
   var mcxOk = _wsMCX && _wsMCX.readyState === WebSocket.OPEN;
   var fxOk  = _wsFX  && _wsFX.readyState  === WebSocket.OPEN;
-  var dataRecent = _lastWsData > 0 && (Date.now() - _lastWsData < 15000);
+  var dataRecent = _lastMcxWsData > 0 && (Date.now() - _lastMcxWsData < 15000);   /* §0: MCX's OWN clock.
+     _lastWsData is touched by ANY socket, FX heartbeats included, and FX is a separate 24/5
+     upstream. So a zombie MCX socket beside a healthy FX one read as "everything is fine" on
+     resume, no reconnect happened, and the gold stream stayed dead for another ~30s. */
   if (mcxOk && fxOk && dataRecent) {
     // Sockets alive and data fresh — just fetch REST for instant render
     try { console.log('[LIFECYCLE] sockets healthy (mcx=OPEN fx=OPEN dataAge=%dms) — skipping reconnect', Date.now() - _lastWsData); } catch(_){}
@@ -6035,7 +6133,10 @@ document.addEventListener('visibilitychange', function() {
   // Smart resume: only force-reconnect if sockets are dead or data stale
   var mcxOk = _wsMCX && _wsMCX.readyState === WebSocket.OPEN;
   var fxOk  = _wsFX  && _wsFX.readyState  === WebSocket.OPEN;
-  var dataRecent = _lastWsData > 0 && (Date.now() - _lastWsData < 15000);
+  var dataRecent = _lastMcxWsData > 0 && (Date.now() - _lastMcxWsData < 15000);   /* §0: MCX's OWN clock.
+     _lastWsData is touched by ANY socket, FX heartbeats included, and FX is a separate 24/5
+     upstream. So a zombie MCX socket beside a healthy FX one read as "everything is fine" on
+     resume, no reconnect happened, and the gold stream stayed dead for another ~30s. */
   if (mcxOk && fxOk && dataRecent) {
     try { console.log('[LIFECYCLE] visibilitychange — sockets healthy, REST only'); } catch(_){}
     fetchREST();
@@ -6449,6 +6550,23 @@ setInterval(function() {
     return;
   }
 
+  /* §0: AND THE SAME FOR FX, because a cure written for one feed is half a cure.
+     There was no FX zombie check at all, so the forex socket could die quietly, keep reporting
+     itself OPEN, and nobody would notice: the SPOT row — GOLD $, SILVER $, INR $ — simply froze,
+     with the badge still green because MCX was alive.
+     This will not cry wolf in a quiet market: the server's FX heartbeat runs every 5s with no
+     market-open condition attached, so an open socket produces something at least that often,
+     weekends included. 30s is six times that. The heartbeat stamps _lastFxWsData BEFORE the `hb`
+     early-return, and that order is what makes a silent market safe. */
+  var fxAge = _lastFxWsData > 0 ? Date.now() - _lastFxWsData : 0;
+  if (fxOk && fxAge > tune('zombieMs', 30000)) {
+    try { console.warn('[ZOMBIE] FX socket OPEN but no FX data for ' + Math.round(fxAge/1000) + 's — forcing reconnect'); } catch(_){}
+    forceReconnectAll();
+    fetchREST();
+    updateBadgeState();
+    return;
+  }
+
   // WS dead: fetch REST fallback
   if ((!mcxOk && !fxOk) && wsAge > tune('wsDeadRestMs', 8000)) { fetchREST(); }
   // WS alive but rates stale >20s during market hours
@@ -6456,6 +6574,7 @@ setInterval(function() {
   // Update badge state every cycle
   updateBadgeState();
   _rrHealthTick();   /* §5/§7 — report being stuck, and reload as a last resort */
+  _rrCheckNeverConnected();   /* §8 — asks nothing of the server, so it works when nothing does */
 }, 5000);
 
 // ── Client-side keepalive ────────────────────────────────────────────────
